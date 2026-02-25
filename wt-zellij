@@ -51,7 +51,14 @@ session_meta_set_field() {
 
 session_meta_touch() {
   local sess="$1"
-  session_meta_set_field "$sess" "last_active_ts" "$(date +%s)"
+  session_meta_mark_activity "$sess" "manual"
+}
+
+session_meta_mark_activity() {
+  local sess="$1" source="${2:-manual}" now
+  now="$(date +%s)"
+  session_meta_set_field "$sess" "last_active_ts" "$now"
+  session_meta_set_field "$sess" "last_active_source" "$source"
 }
 
 session_meta_set_dir() {
@@ -213,26 +220,102 @@ require_zellij() {
   fi
 }
 
-zellij_sessions_short() {
-  (zellij list-sessions -s 2>/dev/null || true) \
-    | awk 'NF && $0 !~ /^No active zellij sessions found/ {print $1}'
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  perl -e '
+    my $sec = shift @ARGV;
+    my $pid = fork();
+    die "fork failed\n" unless defined $pid;
+    if ($pid == 0) {
+      exec @ARGV;
+      exit 127;
+    }
+    $SIG{ALRM} = sub {
+      kill 9, $pid;
+      waitpid($pid, 0);
+      exit 124;
+    };
+    alarm($sec);
+    waitpid($pid, 0);
+    alarm(0);
+    my $status = $? >> 8;
+    exit $status;
+  ' "$timeout_sec" "$@"
+}
+
+mtime_epoch() {
+  local path="$1"
+  [[ -e "$path" ]] || return 1
+  stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null
+}
+
+dir_activity_ts() {
+  local dir="$1" fallback="$2"
+  local best="" ts git_rel git_path git_dir
+
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    if [[ -d "$dir/.git" ]]; then
+      git_dir="$dir/.git"
+    elif [[ -f "$dir/.git" ]]; then
+      git_dir="$(sed -n 's/^gitdir: //p' "$dir/.git" 2>/dev/null | head -n1)"
+      if [[ -n "$git_dir" && "$git_dir" != /* ]]; then
+        git_dir="$dir/$git_dir"
+      fi
+    fi
+  fi
+
+  if [[ -n "$git_dir" ]]; then
+    for git_rel in index HEAD logs/HEAD; do
+      git_path="$git_dir/$git_rel"
+      ts="$(mtime_epoch "$git_path" 2>/dev/null || true)"
+      if [[ "$ts" =~ ^[0-9]+$ ]] && { [[ -z "$best" ]] || (( ts > best )); }; then
+        best="$ts"
+      fi
+    done
+  fi
+
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    ts="$(mtime_epoch "$dir" 2>/dev/null || true)"
+    if [[ "$ts" =~ ^[0-9]+$ ]] && { [[ -z "$best" ]] || (( ts > best )); }; then
+      best="$ts"
+    fi
+  fi
+
+  if [[ "$best" =~ ^[0-9]+$ ]]; then
+    printf "%s" "$best"
+  elif [[ "$fallback" =~ ^[0-9]+$ ]]; then
+    printf "%s" "$fallback"
+  else
+    date +%s
+  fi
 }
 
 session_exists() {
   local sess="$1"
-  zellij_sessions_short | grep -Fxq "$sess"
+  local out
+  out="$(run_with_timeout 3 zellij --session "$sess" action query-tab-names 2>&1 || true)"
+  [[ -n "$out" ]] || return 1
+  [[ "$out" == *"There is no active session"* ]] && return 1
+  [[ "$out" == *"not found"* ]] && return 1
+  [[ "$out" == *"Tab #"* ]] && return 0
+  return 0
 }
 
 ensure_session() {
   local sess="$1" dir="$2"
-  local created=0
+  local attempt
   registry_add_dir "$dir"
   session_meta_set_dir "$sess" "$dir"
   if ! session_exists "$sess"; then
-    (cd "$dir" && zellij attach -c -b "$sess" >/dev/null 2>&1)
-    created=1
+    (cd "$dir" && run_with_timeout 8 zellij attach -c -b "$sess" >/dev/null 2>&1) || true
   fi
-  (( created == 1 )) && session_meta_touch "$sess"
+  for attempt in 1 2 3; do
+    session_exists "$sess" && return 0
+    sleep 0.5
+  done
+  echo "Failed to ensure zellij session '$sess' (timed out)." >&2
+  return 1
 }
 
 dir_for_session() {
@@ -265,16 +348,18 @@ dir_for_session() {
       fi
     done < <(registry_dirs)
 
-    # Last resort: one discovery scan cached for this invocation.
-    while IFS= read -r d; do
-      [[ -n "$d" ]] || continue
-      if [[ "$(hash6 "$d")" == "$h" ]]; then
-        registry_add_dir "$d"
-        session_meta_set_dir "$sess" "$d"
-        printf "%s" "$d"
-        return 0
-      fi
-    done < <(discovered_dirs_cached)
+    if [[ "${WT_ZELLIJ_DIR_DISCOVERY_FALLBACK:-0}" == "1" ]]; then
+      # Last resort: one discovery scan cached for this invocation.
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        if [[ "$(hash6 "$d")" == "$h" ]]; then
+          registry_add_dir "$d"
+          session_meta_set_dir "$sess" "$d"
+          printf "%s" "$d"
+          return 0
+        fi
+      done < <(discovered_dirs_cached)
+    fi
   fi
 
   return 1
@@ -298,7 +383,7 @@ find_active_session_for_dir() {
 
 session_tab_names() {
   local sess="$1"
-  zellij --session "$sess" action query-tab-names 2>/dev/null || true
+  run_with_timeout 4 zellij --session "$sess" action query-tab-names 2>/dev/null || true
 }
 
 session_has_tab() {
@@ -342,7 +427,7 @@ color_agents() {
 session_client_count() {
   local sess="$1"
   local out
-  out="$(zellij --session "$sess" action list-clients 2>/dev/null || true)"
+  out="$(run_with_timeout 4 zellij --session "$sess" action list-clients 2>/dev/null || true)"
   printf "%s\n" "$out" | tail -n +2 | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' '
 }
 
@@ -383,10 +468,10 @@ relative_time() {
 }
 
 list_sessions_raw() {
-  local now line sess phrase age_sec created_ts effective_ts meta_last
+  local now line sess phrase age_sec created_ts effective_ts meta_last meta_source
   now="$(date +%s)"
 
-  (zellij list-sessions -n -r 2>/dev/null || true) \
+  (run_with_timeout 5 zellij list-sessions -n -r 2>/dev/null || true) \
     | while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         [[ "$line" == "No active zellij sessions found."* ]] && continue
@@ -408,7 +493,8 @@ list_sessions_raw() {
 
         effective_ts="$created_ts"
         meta_last="$(session_meta_get_field "$sess" "last_active_ts" 2>/dev/null || true)"
-        if [[ "$meta_last" =~ ^[0-9]+$ ]] && (( meta_last > effective_ts )); then
+        meta_source="$(session_meta_get_field "$sess" "last_active_source" 2>/dev/null || true)"
+        if [[ "$meta_last" =~ ^[0-9]+$ ]] && [[ -n "$meta_source" ]] && (( meta_last > effective_ts )); then
           effective_ts="$meta_last"
         fi
 
@@ -419,6 +505,7 @@ list_sessions_raw() {
 
 list_sessions_pretty() {
   local sess effective_ts created_ts dir dir_short dir_display agents agents_col attached_icon time_ago
+  local meta_last meta_source
   local now_ts
   now_ts="$(date +%s)"
 
@@ -428,6 +515,12 @@ list_sessions_pretty() {
     dir="$(dir_for_session "$sess" 2>/dev/null || true)"
     dir_short="$(short_path "${dir:-(unknown)}")"
     dir_display="$(collapse_dir_for_display "$dir_short")"
+    effective_ts="$(dir_activity_ts "$dir" "$effective_ts")"
+    meta_last="$(session_meta_get_field "$sess" "last_active_ts" 2>/dev/null || true)"
+    meta_source="$(session_meta_get_field "$sess" "last_active_source" 2>/dev/null || true)"
+    if [[ "$meta_last" =~ ^[0-9]+$ ]] && [[ -n "$meta_source" ]] && (( meta_last > effective_ts )); then
+      effective_ts="$meta_last"
+    fi
 
     agents="$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)"
     if [[ -z "$agents" ]]; then
@@ -445,7 +538,8 @@ list_sessions_pretty() {
     time_ago="${C_GRAY}$(relative_time "$effective_ts" "$now_ts")${C_RESET}"
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$sess" "$effective_ts" "$attached_icon" "$agents_col" "$dir_display" "$time_ago"
-  done < <(list_sessions_raw)
+  done < <(list_sessions_raw) \
+    | sort -t$'\t' -k2,2nr
 }
 
 preview_session() {
@@ -463,7 +557,7 @@ preview_session() {
   printf "tabs:   %s\n\n" "$tabs"
 
   tmp="$(mktemp)"
-  if zellij --session "$sess" action dump-screen -f "$tmp" >/dev/null 2>&1; then
+  if run_with_timeout 4 zellij --session "$sess" action dump-screen -f "$tmp" >/dev/null 2>&1; then
     tail -n 80 "$tmp"
   else
     echo "(no preview)"
@@ -474,21 +568,33 @@ preview_session() {
 ensure_agent_tab() {
   local sess="$1" wname="$2" dir="$3" cmd="$4"
   local launch_cmd
+  local clients=0
 
   if ! session_has_tab "$sess" "$wname"; then
-    zellij --session "$sess" action new-tab -n "$wname" -c "$dir" >/dev/null 2>&1 || true
+    run_with_timeout 4 zellij --session "$sess" action new-tab -n "$wname" -c "$dir" >/dev/null 2>&1 || true
+    # If the previous call timed out or failed, try create-via-focus as fallback.
+    if ! session_has_tab "$sess" "$wname"; then
+      run_with_timeout 4 zellij --session "$sess" action go-to-tab-name --create "$wname" >/dev/null 2>&1 || true
+    fi
     launch_cmd="cd \"$dir\" && ${cmd}; exec \"\$SHELL\" -l"
-    zellij --session "$sess" run --cwd "$dir" --close-on-exit -- bash -lc "$launch_cmd" >/dev/null 2>&1 || true
+    # Launch command asynchronously so wt does not block on long-running agent startups.
+    (run_with_timeout 6 zellij --session "$sess" run --cwd "$dir" --close-on-exit -- bash -lc "$launch_cmd" >/dev/null 2>&1 || true) &
   fi
-  zellij --session "$sess" action go-to-tab-name "$wname" >/dev/null 2>&1 || true
+  clients="$(session_client_count "$sess" 2>/dev/null || echo 0)"
+  if [[ "$clients" =~ ^[0-9]+$ ]] && (( clients > 0 )); then
+    run_with_timeout 2 zellij --session "$sess" action go-to-tab-name "$wname" >/dev/null 2>&1 || true
+  fi
   session_meta_set_dir "$sess" "$dir"
   session_meta_set_field "$sess" "agents" "$(session_agents "$sess")"
-  session_meta_touch "$sess"
+  session_meta_mark_activity "$sess" "agent-tab"
 }
 
 attach_session() {
   local sess="$1"
-  session_meta_touch "$sess"
+  session_meta_mark_activity "$sess" "attach"
+  if [[ "${WT_NO_ATTACH:-0}" == "1" ]]; then
+    return 0
+  fi
   if inside_zellij; then
     echo "Already inside a zellij session. Use the session UI to switch sessions." >&2
     echo "Tip: Ctrl+o then w (default keybind) opens session switcher." >&2
@@ -514,8 +620,9 @@ rehydrate_sessions() {
       registry_add_dir "$dir"
       sess="$(sess_for_dir "$dir")"
       if ! session_exists "$sess"; then
-        ensure_session "$sess" "$dir"
-        ((created++))
+        if ensure_session "$sess" "$dir"; then
+          ((created++))
+        fi
       fi
     done < <(discover_worktree_dirs)
   else
@@ -523,8 +630,9 @@ rehydrate_sessions() {
       [[ -n "$dir" ]] || continue
       sess="$(sess_for_dir "$dir")"
       if ! session_exists "$sess"; then
-        ensure_session "$sess" "$dir"
-        ((created++))
+        if ensure_session "$sess" "$dir"; then
+          ((created++))
+        fi
       fi
     done < <(registry_dirs)
   fi
@@ -616,7 +724,7 @@ main() {
     here)
       dir="$(canonpath "$PWD")"
       sess="$(sess_for_dir "$dir")"
-      ensure_session "$sess" "$dir"
+      ensure_session "$sess" "$dir" || return 1
       if [[ -z "$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)" ]]; then
         session_meta_set_field "$sess" "agents" "(none)"
       fi
@@ -626,7 +734,7 @@ main() {
     codex)
       dir="$(canonpath "$PWD")"
       sess="$(sess_for_dir "$dir")"
-      ensure_session "$sess" "$dir"
+      ensure_session "$sess" "$dir" || return 1
       ensure_agent_tab "$sess" "codex" "$dir" "codex --yolo resume"
       attach_session "$sess"
       ;;
@@ -634,7 +742,7 @@ main() {
     claude)
       dir="$(canonpath "$PWD")"
       sess="$(sess_for_dir "$dir")"
-      ensure_session "$sess" "$dir"
+      ensure_session "$sess" "$dir" || return 1
       ensure_agent_tab "$sess" "claude" "$dir" "claude --dangerously-skip-permissions --continue"
       attach_session "$sess"
       ;;
