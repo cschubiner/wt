@@ -142,13 +142,6 @@ inside_zellij() {
     return 0
   fi
 
-  # Fallback for shells that unexpectedly drop Zellij env vars.
-  if run_with_timeout 1 zellij action query-tab-names >/dev/null 2>&1; then
-    WT_ZELLIJ_INSIDE_CACHE_SET=1
-    WT_ZELLIJ_INSIDE_CACHE=1
-    return 0
-  fi
-
   WT_ZELLIJ_INSIDE_CACHE_SET=1
   WT_ZELLIJ_INSIDE_CACHE=0
   return 1
@@ -703,7 +696,6 @@ ensure_agent_tab() {
 
 attach_session() {
   local sess="$1"
-  local old_tty=""
   session_meta_mark_activity "$sess" "attach"
   if [[ "${WT_NO_ATTACH:-0}" == "1" ]]; then
     return 0
@@ -718,16 +710,11 @@ attach_session() {
   # fzf can occasionally leave terminal modes enabled (eg kitty keyboard protocol),
   # which breaks some zellij keybind handling until a manual reset.
   if [[ -r /dev/tty && -w /dev/tty ]]; then
-    old_tty="$(stty -g < /dev/tty 2>/dev/null || true)"
     stty sane < /dev/tty 2>/dev/null || true
-    printf '\033[?1l\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1006l\033[?1015l\033[?2004l\033[>4;0m\033[<u' > /dev/tty 2>/dev/null || true
-    # Drain pending keypress bytes so zellij does not consume stale input from fzf.
-    stty -icanon -echo min 0 time 0 < /dev/tty 2>/dev/null || true
-    dd if=/dev/tty of=/dev/null bs=128 count=1 2>/dev/null || true
-    [[ -n "$old_tty" ]] && stty "$old_tty" < /dev/tty 2>/dev/null || true
+    printf '\033[?2004l\033[>4;0m' > /dev/tty 2>/dev/null || true
   fi
   debug_log "attach_exec sess=$sess"
-  zellij attach "$sess" < /dev/tty > /dev/tty
+  zellij attach "$sess"
 }
 
 kill_entry() {
