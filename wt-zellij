@@ -14,6 +14,8 @@ C_GRAY=$'\033[0;90m'
 WT_REGISTRY_FILE="${WT_REGISTRY_FILE:-$HOME/.wt_registry}"
 WT_ZELLIJ_STATE_DIR="${WT_ZELLIJ_STATE_DIR:-$HOME/.wt_zellij}"
 WT_ZELLIJ_META_DIR="$WT_ZELLIJ_STATE_DIR/sessions"
+WT_ZELLIJ_AGE_CACHE_FILE="${WT_ZELLIJ_AGE_CACHE_FILE:-$WT_ZELLIJ_STATE_DIR/age_cache.tsv}"
+WT_ZELLIJ_AGE_CACHE_LOCK_FILE="$WT_ZELLIJ_STATE_DIR/age_cache.lock"
 WT_ZELLIJ_DISCOVERY_CACHE_FILE=""
 
 cleanup_runtime_files() {
@@ -168,7 +170,7 @@ registry_dirs() {
   [[ -f "$WT_REGISTRY_FILE" ]] || return 0
   while IFS= read -r d; do
     [[ -d "$d" ]] || continue
-    canonpath "$d"
+    printf "%s\n" "$d"
   done < "$WT_REGISTRY_FILE" | awk 'NF && !seen[$0]++'
 }
 
@@ -288,6 +290,37 @@ dir_activity_ts() {
     printf "%s" "$fallback"
   else
     date +%s
+  fi
+}
+
+refresh_age_cache() {
+  local tmp now dir ts
+  ensure_state_dirs
+  tmp="$(mktemp)"
+  now="$(date +%s)"
+  while IFS= read -r dir; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    ts="$(dir_activity_ts "$dir" "$now")"
+    printf "%s\t%s\t%s\n" "$dir" "$ts" "$now" >> "$tmp"
+  done < <(registry_dirs)
+  mv "$tmp" "$WT_ZELLIJ_AGE_CACHE_FILE"
+}
+
+maybe_refresh_age_cache_async() {
+  local now cache_mtime ttl
+  ttl="${WT_ZELLIJ_AGE_CACHE_TTL:-120}"
+  now="$(date +%s)"
+  cache_mtime="$(mtime_epoch "$WT_ZELLIJ_AGE_CACHE_FILE" 2>/dev/null || echo 0)"
+  if [[ "$cache_mtime" =~ ^[0-9]+$ ]] && (( now - cache_mtime < ttl )); then
+    return 0
+  fi
+
+  ensure_state_dirs
+  if ( set -o noclobber; : > "$WT_ZELLIJ_AGE_CACHE_LOCK_FILE" ) 2>/dev/null; then
+    (
+      "$0" _refresh_age_cache >/dev/null 2>&1 || true
+      rm -f "$WT_ZELLIJ_AGE_CACHE_LOCK_FILE" >/dev/null 2>&1 || true
+    ) &
   fi
 }
 
@@ -460,6 +493,7 @@ relative_time() {
   local delta
   [[ -z "$now" ]] && now="$(date +%s)"
   delta=$(( now - ts ))
+  (( delta < 0 )) && delta=0
   if   (( delta < 60   )); then printf "%ds ago" "$delta"
   elif (( delta < 3600 )); then printf "%dm ago" "$(( delta / 60 ))"
   elif (( delta < 86400)); then printf "%dh ago" "$(( delta / 3600 ))"
@@ -503,33 +537,64 @@ list_sessions_raw() {
     | sort -t'|' -k2,2nr
 }
 
+list_known_sessions_raw() {
+  local now_ts dir ts
+  now_ts="$(date +%s)"
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    ts="$now_ts"
+    printf "%s|%s|%s|0|%s\n" "$dir" "$ts" "$ts" "$dir"
+  done < <(registry_dirs) | sort -t'|' -k2,2nr
+}
+
+list_known_sessions_with_cached_age() {
+  local tmp_known
+  tmp_known="$(mktemp)"
+  list_known_sessions_raw > "$tmp_known"
+  if [[ -f "$WT_ZELLIJ_AGE_CACHE_FILE" ]]; then
+    awk -F'\t' '
+      FNR == NR {
+        if (NF >= 2 && $2 ~ /^[0-9]+$/) {
+          age_ts[$1] = $2
+        }
+        next
+      }
+      {
+        n = split($0, a, "|")
+        dir = (n >= 5 ? a[5] : "")
+        if (dir in age_ts) {
+          a[2] = age_ts[dir]
+        }
+        print a[1] "|" a[2] "|" a[3] "|" a[4] "|" a[5]
+      }
+    ' "$WT_ZELLIJ_AGE_CACHE_FILE" "$tmp_known"
+  else
+    cat "$tmp_known"
+  fi
+  rm -f "$tmp_known"
+}
+
 list_sessions_pretty() {
-  local sess effective_ts created_ts dir dir_short dir_display agents agents_col attached_icon time_ago
-  local meta_last meta_source
+  local sess effective_ts created_ts is_active dir dir_short dir_display agents agents_col attached_icon time_ago
   local now_ts
   now_ts="$(date +%s)"
+  maybe_refresh_age_cache_async
 
-  while IFS='|' read -r sess effective_ts created_ts; do
+  while IFS='|' read -r sess effective_ts created_ts is_active dir; do
     [[ -n "$sess" ]] || continue
 
-    dir="$(dir_for_session "$sess" 2>/dev/null || true)"
     dir_short="$(short_path "${dir:-(unknown)}")"
     dir_display="$(collapse_dir_for_display "$dir_short")"
-    effective_ts="$(dir_activity_ts "$dir" "$effective_ts")"
-    meta_last="$(session_meta_get_field "$sess" "last_active_ts" 2>/dev/null || true)"
-    meta_source="$(session_meta_get_field "$sess" "last_active_source" 2>/dev/null || true)"
-    if [[ "$meta_last" =~ ^[0-9]+$ ]] && [[ -n "$meta_source" ]] && (( meta_last > effective_ts )); then
-      effective_ts="$meta_last"
-    fi
 
-    agents="$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)"
-    if [[ -z "$agents" ]]; then
-      agents="$(session_agents "$sess")"
-      session_meta_set_field "$sess" "agents" "$agents"
+    if [[ "$is_active" == "1" ]]; then
+      agents="$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)"
+      [[ -n "$agents" ]] || agents="(none)"
+    else
+      agents="(none)"
     fi
     agents_col="$(color_agents "$agents")"
 
-    if inside_zellij && [[ "${ZELLIJ_SESSION_NAME:-}" == "$sess" ]]; then
+    if [[ "$is_active" == "1" ]] && inside_zellij && [[ "${ZELLIJ_SESSION_NAME:-}" == "$sess" ]]; then
       attached_icon="${C_GREEN}●${C_RESET}"
     else
       attached_icon="${C_GRAY}○${C_RESET}"
@@ -538,23 +603,41 @@ list_sessions_pretty() {
     time_ago="${C_GRAY}$(relative_time "$effective_ts" "$now_ts")${C_RESET}"
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$sess" "$effective_ts" "$attached_icon" "$agents_col" "$dir_display" "$time_ago"
-  done < <(list_sessions_raw) \
+  done < <(list_known_sessions_with_cached_age) \
     | sort -t$'\t' -k2,2nr
 }
 
 preview_session() {
   local sess="$1"
   local agents dir tabs tmp
+  local is_active=1
 
-  agents="$(session_agents "$sess")"
+  if [[ -d "$sess" ]]; then
+    dir="$sess"
+    sess="$(sess_for_dir "$dir")"
+  fi
+
+  session_exists "$sess" || is_active=0
+  if [[ "$is_active" == "1" ]]; then
+    agents="$(session_agents "$sess")"
+  else
+    agents="$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)"
+    [[ -n "$agents" ]] || agents="(none)"
+  fi
   dir="$(dir_for_session "$sess" 2>/dev/null || echo "(unknown)")"
-  tabs="$(session_tab_names "$sess" | paste -sd ', ' -)"
-  [[ -z "$tabs" ]] && tabs="(none)"
+  if [[ "$is_active" == "1" ]]; then
+    tabs="$(session_tab_names "$sess" | paste -sd ', ' -)"
+    [[ -z "$tabs" ]] && tabs="(none)"
+  else
+    tabs="(session not active - will be created on attach)"
+  fi
 
   printf "\033[1;37m── %s ──\033[0m\n" "$sess"
   printf "agents: %s\n" "$agents"
   printf "dir:    %s\n" "$(short_path "$dir")"
   printf "tabs:   %s\n\n" "$tabs"
+
+  [[ "$is_active" == "1" ]] || return 0
 
   tmp="$(mktemp)"
   if run_with_timeout 4 zellij --session "$sess" action dump-screen -f "$tmp" >/dev/null 2>&1; then
@@ -603,6 +686,19 @@ attach_session() {
   zellij attach "$sess"
 }
 
+kill_entry() {
+  local entry="$1"
+  local sess="$entry"
+  local dir
+  if [[ -d "$entry" ]]; then
+    dir="$(canonpath "$entry")"
+    sess="$(sess_for_dir "$dir")"
+  fi
+  [[ -n "$sess" ]] || return 0
+  zellij kill-session "$sess" >/dev/null 2>&1 || true
+  session_meta_remove "$sess"
+}
+
 rehydrate_sessions() {
   local mode="${1:-auto}"
   local dir sess created=0
@@ -648,12 +744,11 @@ rehydrate_if_needed() {
 pick_and_attach() {
   local target_window="${1:-}"
   local line sess selection key dir
+  local session_is_active=1
   local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
 
-  rehydrate_if_needed
-
-  if [[ -z "$(list_sessions_raw)" ]]; then
-    echo "No wt sessions found. Run 'wt here' in a repo, or run 'wt revive' (or 'wt revive full')." >&2
+  if [[ -z "$(list_known_sessions_raw)" ]]; then
+    echo "No wt folders found. Run 'wt here' in a repo, or run 'wt revive' (or 'wt revive full')." >&2
     return 0
   fi
 
@@ -669,7 +764,7 @@ pick_and_attach() {
       --preview="$self _preview {1}" \
       --preview-window='up:30%:wrap' \
       --expect=enter,left,right \
-      --bind "ctrl-k:execute-silent(zellij kill-session {1})+reload($self _list)+clear-query+first" \
+      --bind "ctrl-k:execute-silent($self _kill_entry {1})+reload($self _list)+clear-query+first" \
       --no-sort \
     )" || return 0
 
@@ -700,8 +795,24 @@ pick_and_attach() {
   fi
 
   [[ -n "$sess" ]] || return 0
+  if [[ -d "$sess" ]]; then
+    dir="$(canonpath "$sess")"
+    sess="$(sess_for_dir "$dir")"
+    session_meta_set_dir "$sess" "$dir"
+  fi
   if [[ -z "$(session_meta_get_field "$sess" "agents" 2>/dev/null || true)" ]]; then
-    session_meta_set_field "$sess" "agents" "$(session_agents "$sess")"
+    if session_exists "$sess"; then
+      session_meta_set_field "$sess" "agents" "$(session_agents "$sess")"
+    else
+      session_meta_set_field "$sess" "agents" "(none)"
+    fi
+  fi
+  if ! session_exists "$sess"; then
+    session_is_active=0
+  fi
+  if [[ "$session_is_active" == "0" ]]; then
+    dir="${dir:-$(dir_for_session "$sess" 2>/dev/null || printf "%s" "$PWD")}"
+    ensure_session "$sess" "$dir" || return 1
   fi
   if [[ -n "$target_window" ]]; then
     dir="$(dir_for_session "$sess" 2>/dev/null || printf "%s" "$PWD")"
@@ -760,10 +871,20 @@ main() {
       list_sessions_pretty
       ;;
 
+    _refresh_age_cache)
+      refresh_age_cache
+      ;;
+
     _preview)
       sess="${2:-}"
       [[ -z "$sess" ]] && exit 0
       preview_session "$sess"
+      ;;
+
+    _kill_entry)
+      sess="${2:-}"
+      [[ -z "$sess" ]] && exit 0
+      kill_entry "$sess"
       ;;
 
     ls)
@@ -794,7 +915,7 @@ Usage: wt [subcommand]
   here      Create/attach zellij session for current directory (default)
   codex     Ensure a "codex" tab exists (runs `codex --yolo resume` on first use)
   claude    Ensure a "claude" tab exists (runs `claude --dangerously-skip-permissions --continue` on first use)
-  pick      Fuzzy-pick from all active wt sessions and attach (optionally pass `codex` or `claude` to focus that tab)
+  pick      Fuzzy-pick from all known wt folders (active + dormant) and attach (optionally pass `codex` or `claude` to focus that tab)
               in picker: Left=codex, Right=claude, Enter=default tab
               ctrl-k  kill selected session and reload list
   revive    Recreate missing wt sessions
