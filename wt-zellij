@@ -683,7 +683,13 @@ attach_session() {
     echo "Tip: Ctrl+o then w (default keybind) opens session switcher." >&2
     return 0
   fi
-  zellij attach "$sess"
+  # fzf can occasionally leave terminal modes enabled (eg kitty keyboard protocol),
+  # which breaks some zellij keybind handling until a manual reset.
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    stty sane < /dev/tty 2>/dev/null || true
+    printf '\033[?2004l\033[>4;0m' > /dev/tty 2>/dev/null || true
+  fi
+  zellij attach "$sess" < /dev/tty > /dev/tty
 }
 
 kill_entry() {
