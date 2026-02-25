@@ -55,3 +55,7 @@ Override roots with:
 ```bash
 export WT_DISCOVER_ROOTS="/abs/path/one:/abs/path/two"
 ```
+
+## License
+
+MIT
