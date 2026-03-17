@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # wt — persistent workspace manager for git worktrees
-# Usage: wt [here|codex|claude|pick|revive|ls|kill]
+# Usage: wt [here|codex|claude|pick|pickdir|cd|revive|ls|kill]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -188,10 +188,28 @@ rehydrate_sessions() {
 mark_session_known() {
   local sess="$1" dir=""
   [[ -n "$sess" ]] || return 0
-  dir="$(tmux display-message -p -t "$sess" '#{@wt_dir}' 2>/dev/null || true)"
-  [[ -z "$dir" ]] && dir="$(tmux display-message -p -t "$sess" '#{session_path}' 2>/dev/null || true)"
+  dir="$(dir_for_session "$sess" 2>/dev/null || true)"
   [[ -z "$dir" ]] && dir="$(tmux show-environment -t "$sess" WT_DIR 2>/dev/null | sed -n 's/^WT_DIR=//p' || true)"
   [[ -n "$dir" ]] && registry_add_dir "$dir"
+}
+
+dir_for_session() {
+  local sess="$1" dir=""
+  [[ -n "$sess" ]] || return 1
+  dir="$(tmux display-message -p -t "$sess" '#{@wt_dir}' 2>/dev/null || true)"
+  [[ -z "$dir" ]] && dir="$(tmux display-message -p -t "$sess" '#{session_path}' 2>/dev/null || true)"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  canonpath "$dir"
+}
+
+emit_pick_cd_action() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  if [[ -n "${WT_PICK_ACTION_FILE:-}" ]]; then
+    printf "cd\t%s\n" "$dir" > "$WT_PICK_ACTION_FILE"
+  else
+    printf "%s\n" "$dir"
+  fi
 }
 
 rehydrate_if_needed() {
@@ -440,7 +458,7 @@ preview_session() {
 }
 pick_and_attach() {
   local target_window="${1:-}"
-  local line sess selection key
+  local line sess selection key="enter"
   local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
 
   rehydrate_if_needed
@@ -456,12 +474,12 @@ pick_and_attach() {
       --height=100% \
       --delimiter=$'\t' \
       --with-nth=3,4,5,6 \
-      --header=$'  \033[1mattached  agents           dir                          last active\033[0m\n  Enter: default  Left: codex  Right: claude  Ctrl-k: kill session' \
+      --header=$'  \033[1mattached  agents           dir                          last active\033[0m\n  Enter: cd dir  Left: codex  Right: claude  Ctrl-g: attach  Ctrl-k: kill session' \
       --prompt='❯ ' \
       --info-command='printf "%s/%s" "$FZF_POS" "$FZF_MATCH_COUNT"' \
       --preview="$self _preview {1}" \
       --preview-window='up:30%:wrap' \
-      --expect=enter,left,right \
+      --expect=enter,left,right,ctrl-g \
       --bind "ctrl-k:execute-silent(tmux kill-session -t {1})+reload($self _list)+clear-query+first" \
       --no-sort \
     )" || return 0
@@ -495,11 +513,76 @@ pick_and_attach() {
   fi
 
   [[ -n "$sess" ]] || return 0
+  if [[ "$key" == "enter" ]]; then
+    local dir
+    dir="$(dir_for_session "$sess" 2>/dev/null || true)"
+    [[ -n "$dir" ]] || {
+      echo "Could not resolve directory for selection: $sess" >&2
+      return 1
+    }
+    emit_pick_cd_action "$dir"
+    return 0
+  fi
   mark_session_known "$sess"
   attach_or_switch "$sess"
   if [[ -n "$target_window" ]] && window_exists "$sess" "$target_window"; then
     focus_window "$sess" "$target_window"
   fi
+}
+
+pick_directory() {
+  local line sess selection dir
+  local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
+
+  rehydrate_if_needed
+
+  if [[ -z "$(list_sessions_raw)" ]]; then
+    echo "No wt sessions found. Run 'wt here' in a repo, or run 'wt revive' (or 'wt revive full')." >&2
+    return 0
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    selection="$(list_sessions_pretty | fzf \
+      --ansi \
+      --height=100% \
+      --delimiter=$'\t' \
+      --with-nth=3,4,5,6 \
+      --header=$'  \033[1mattached  agents           dir                          last active\033[0m\n  Enter: print selected directory path' \
+      --prompt='❯ ' \
+      --info-command='printf "%s/%s" "$FZF_POS" "$FZF_MATCH_COUNT"' \
+      --preview="$self _preview {1}" \
+      --preview-window='up:30%:wrap' \
+      --expect=enter \
+      --no-sort \
+    )" || return 0
+    line="$(printf "%s\n" "$selection" | sed -n '2p')"
+    sess="$(printf "%s" "$line" | cut -f1)"
+  else
+    local -a sessions
+    local i=1
+    while IFS= read -r entry; do
+      sessions+=("$entry")
+      local agents dir_text time_ago
+      agents="$(printf "%s" "$entry" | cut -f4 | sed 's/\x1b\[[0-9;]*m//g')"
+      dir_text="$(printf "%s" "$entry" | cut -f5)"
+      time_ago="$(printf "%s" "$entry" | cut -f6 | sed 's/\x1b\[[0-9;]*m//g')"
+      printf "  %2d) %-20s  %-30s  %s\n" "$i" "$agents" "$dir_text" "$time_ago" >&2
+      (( i++ ))
+    done < <(list_sessions_pretty)
+    [[ ${#sessions[@]} -eq 0 ]] && echo "No wt sessions." && return 0
+    printf "Pick session [1-%d]: " "${#sessions[@]}" >&2
+    read -r choice
+    [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#sessions[@]}" ]] || return 0
+    sess="$(printf "%s" "${sessions[$((choice-1))]}" | cut -f1)"
+  fi
+
+  [[ -n "$sess" ]] || return 0
+  dir="$(dir_for_session "$sess" 2>/dev/null || true)"
+  [[ -n "$dir" && -d "$dir" ]] || {
+    echo "Could not resolve directory for selection: $sess" >&2
+    return 1
+  }
+  printf "%s\n" "$dir"
 }
 
 # ---- main ----
@@ -534,6 +617,10 @@ case "$cmd" in
 
   pick)
     pick_and_attach "${2:-}"
+    ;;
+
+  pickdir|cd)
+    pick_directory
     ;;
 
   revive)
@@ -582,8 +669,11 @@ Usage: wt [subcommand]
   codex     Ensure a "codex" window exists (runs `codex --yolo resume` on first use)
   claude    Ensure a "claude" window exists (runs `claude --dangerously-skip-permissions --continue` on first use)
   pick      Fuzzy-pick from all active wt sessions and attach (optionally pass `codex` or `claude` to focus that window)
-              in picker: Left=codex, Right=claude, Enter=default window
+              in picker: Enter=cd directory, Left=codex, Right=claude, Ctrl-g=default attach
+              Enter cd requires wt.sh wrapper for in-shell cd
               ctrl-k  kill selected session and reload list
+  pickdir   Fuzzy-pick and print the selected directory path (does not attach/start tmux)
+  cd        Alias for `pickdir` (intended for shell wrapper functions that run `cd`)
   revive    Recreate missing wt sessions
               default: restore from $WT_REGISTRY_FILE (dirs you've used with wt)
               full:    run `wt revive full` to scan discovery roots
